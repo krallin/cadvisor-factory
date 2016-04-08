@@ -1,0 +1,24 @@
+From e4127567d55a81d441a275c362dadd0228a75ada Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Fri, 8 Apr 2016 19:09:13 +0200
+Subject: [PATCH] Add support for ecryptfs mount type
+
+---
+ fs/fs.go | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/fs/fs.go b/fs/fs.go
+index d6e9e27..4eb2f55 100644
+--- a/fs/fs.go
++++ b/fs/fs.go
+@@ -81,6 +81,7 @@ func NewFsInfo(context Context) (FsInfo, error) {
+ 		"btrfs": true,
+ 		"xfs":   true,
+ 		"zfs":   true,
++		"ecryptfs": true,
+ 	}
+ 	for _, mount := range mounts {
+ 		var Fstype string
+-- 
+2.7.4
+

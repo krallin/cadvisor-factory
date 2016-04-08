@@ -1,0 +1,637 @@
+From 103681ae7c4a91f92375f65be874de0bb5bf8e50 Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Fri, 8 Apr 2016 22:18:55 +0200
+Subject: [PATCH] WIP - Refactor RealFsInfo with PartitionCache
+
+---
+ fs/fs.go              | 207 +++++++-----------------------------
+ fs/partition_cache.go | 288 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ fs/types.go           |  12 +++
+ 3 files changed, 339 insertions(+), 168 deletions(-)
+ create mode 100644 fs/partition_cache.go
+
+diff --git a/fs/fs.go b/fs/fs.go
+index 4eb2f55..f47377f 100644
+--- a/fs/fs.go
++++ b/fs/fs.go
+@@ -19,29 +19,21 @@ package fs
+ 
+ import (
+ 	"bufio"
+-	"encoding/json"
+ 	"fmt"
+ 	"io/ioutil"
+ 	"os"
+ 	"os/exec"
+ 	"path"
+-	"path/filepath"
+ 	"regexp"
+ 	"strconv"
+ 	"strings"
+ 	"syscall"
+ 	"time"
+ 
+-	"github.com/docker/docker/pkg/mount"
+ 	"github.com/golang/glog"
+ 	zfs "github.com/mistifyio/go-zfs"
+ )
+ 
+-const (
+-	LabelSystemRoot   = "root"
+-	LabelDockerImages = "docker-images"
+-)
+-
+ type partition struct {
+ 	mountpoint string
+ 	major      uint
+@@ -51,13 +43,7 @@ type partition struct {
+ }
+ 
+ type RealFsInfo struct {
+-	// Map from block device path to partition information.
+-	partitions map[string]partition
+-	// Map from label to block device path.
+-	// Labels are intent-specific tags that are auto-detected.
+-	labels map[string]string
+-
+-	dmsetup dmsetupClient
++	partitionCache PartitionCache
+ }
+ 
+ type Context struct {
+@@ -67,170 +53,44 @@ type Context struct {
+ }
+ 
+ func NewFsInfo(context Context) (FsInfo, error) {
+-	mounts, err := mount.GetMounts()
+-	if err != nil {
+-		return nil, err
+-	}
+-	fsInfo := &RealFsInfo{
+-		partitions: make(map[string]partition, 0),
+-		labels:     make(map[string]string, 0),
+-		dmsetup:    &defaultDmsetupClient{},
+-	}
+-	supportedFsType := map[string]bool{
+-		// all ext systems are checked through prefix.
+-		"btrfs": true,
+-		"xfs":   true,
+-		"zfs":   true,
+-		"ecryptfs": true,
+-	}
+-	for _, mount := range mounts {
+-		var Fstype string
+-		if !strings.HasPrefix(mount.Fstype, "ext") && !supportedFsType[mount.Fstype] {
+-			continue
+-		}
+-		// Avoid bind mounts.
+-		if _, ok := fsInfo.partitions[mount.Source]; ok {
+-			continue
+-		}
+-		if mount.Fstype == "zfs" {
+-			Fstype = mount.Fstype
+-		}
+-		fsInfo.partitions[mount.Source] = partition{
+-			fsType:     Fstype,
+-			mountpoint: mount.Mountpoint,
+-			major:      uint(mount.Major),
+-			minor:      uint(mount.Minor),
+-		}
+-	}
++	fsInfo := &RealFsInfo{}
+ 
+-	// need to call this before the log line below printing out the partitions, as this function may
+-	// add a "partition" for devicemapper to fsInfo.partitions
+-	fsInfo.addDockerImagesLabel(context)
+-
+-	glog.Infof("Filesystem partitions: %+v", fsInfo.partitions)
+-	fsInfo.addSystemRootLabel()
+-	return fsInfo, nil
+-}
+-
+-// getDockerDeviceMapperInfo returns information about the devicemapper device and "partition" if
+-// docker is using devicemapper for its storage driver. If a loopback device is being used, don't
+-// return any information or error, as we want to report based on the actual partition where the
+-// loopback file resides, inside of the loopback file itself.
+-func (self *RealFsInfo) getDockerDeviceMapperInfo(dockerInfo map[string]string) (string, *partition, error) {
+-	if storageDriver, ok := dockerInfo["Driver"]; ok && storageDriver != DeviceMapper.String() {
+-		return "", nil, nil
+-	}
+-
+-	var driverStatus [][]string
+-	if err := json.Unmarshal([]byte(dockerInfo["DriverStatus"]), &driverStatus); err != nil {
+-		return "", nil, err
+-	}
+-
+-	dataLoopFile := dockerStatusValue(driverStatus, "Data loop file")
+-	if len(dataLoopFile) > 0 {
+-		return "", nil, nil
+-	}
+-
+-	dev, major, minor, blockSize, err := dockerDMDevice(driverStatus, self.dmsetup)
++	partitionCache, err := NewPartitionCache(context)
+ 	if err != nil {
+-		return "", nil, err
+-	}
+-
+-	return dev, &partition{
+-		fsType:    DeviceMapper.String(),
+-		major:     major,
+-		minor:     minor,
+-		blockSize: blockSize,
+-	}, nil
+-}
+-
+-// addSystemRootLabel attempts to determine which device contains the mount for /.
+-func (self *RealFsInfo) addSystemRootLabel() {
+-	for src, p := range self.partitions {
+-		if p.mountpoint == "/" {
+-			if _, ok := self.labels[LabelSystemRoot]; !ok {
+-				self.labels[LabelSystemRoot] = src
+-			}
+-		}
++		return nil, err
+ 	}
+-}
++	fsInfo.partitionCache = partitionCache
+ 
+-// addDockerImagesLabel attempts to determine which device contains the mount for docker images.
+-func (self *RealFsInfo) addDockerImagesLabel(context Context) {
+-	dockerDev, dockerPartition, err := self.getDockerDeviceMapperInfo(context.DockerInfo)
+-	if err != nil {
+-		glog.Warningf("Could not get Docker devicemapper device: %v", err)
+-	}
+-	if len(dockerDev) > 0 && dockerPartition != nil {
+-		self.partitions[dockerDev] = *dockerPartition
+-		self.labels[LabelDockerImages] = dockerDev
+-	} else {
+-		dockerPaths := getDockerImagePaths(context)
+-
+-		for src, p := range self.partitions {
+-			self.updateDockerImagesPath(src, p.mountpoint, dockerPaths)
+-		}
+-	}
+-}
++	partitions := make([]partition, 0)
++	fsInfo.partitionCache.ApplyOverPartitions(func(_ string, p partition) error {
++		partitions = append(partitions, p)
++		return nil
++	})
+ 
+-// Generate a list of possible mount points for docker image management from the docker root directory.
+-// Right now, we look for each type of supported graph driver directories, but we can do better by parsing
+-// some of the context from `docker info`.
+-func getDockerImagePaths(context Context) []string {
+-	// TODO(rjnagal): Detect docker root and graphdriver directories from docker info.
+-	dockerRoot := context.DockerRoot
+-	dockerImagePaths := []string{}
+-	for _, dir := range []string{"devicemapper", "btrfs", "aufs", "overlay", "zfs"} {
+-		dockerImagePaths = append(dockerImagePaths, path.Join(dockerRoot, dir))
+-	}
+-	for dockerRoot != "/" && dockerRoot != "." {
+-		dockerImagePaths = append(dockerImagePaths, dockerRoot)
+-		dockerRoot = filepath.Dir(dockerRoot)
+-	}
+-	dockerImagePaths = append(dockerImagePaths, "/")
+-	return dockerImagePaths
+-}
++	glog.Infof("Filesystem partitions: %+v", partitions)
+ 
+-// This method compares the mountpoint with possible docker image mount points. If a match is found,
+-// docker images label is added to the partition.
+-func (self *RealFsInfo) updateDockerImagesPath(source string, mountpoint string, dockerImagePaths []string) {
+-	for _, v := range dockerImagePaths {
+-		if v == mountpoint {
+-			if i, ok := self.labels[LabelDockerImages]; ok {
+-				// pick the innermost mountpoint.
+-				mnt := self.partitions[i].mountpoint
+-				if len(mnt) < len(mountpoint) {
+-					self.labels[LabelDockerImages] = source
+-				}
+-			} else {
+-				self.labels[LabelDockerImages] = source
+-			}
+-		}
+-	}
++	return fsInfo, nil
+ }
+ 
+ func (self *RealFsInfo) GetDeviceForLabel(label string) (string, error) {
+-	dev, ok := self.labels[label]
+-	if !ok {
+-		return "", fmt.Errorf("non-existent label %q", label)
+-	}
+-	return dev, nil
++	return self.partitionCache.DeviceForLabel(label)
+ }
+ 
+ func (self *RealFsInfo) GetLabelsForDevice(device string) ([]string, error) {
+-	labels := []string{}
+-	for label, dev := range self.labels {
+-		if dev == device {
++	labels := make([]string, 0)
++	self.partitionCache.ApplyOverLabels(func(label string, deviceForLabel string) error {
++		if device == deviceForLabel {
+ 			labels = append(labels, label)
+ 		}
+-	}
++		return nil
++	})
+ 	return labels, nil
+ }
+ 
+ func (self *RealFsInfo) GetMountpointForDevice(dev string) (string, error) {
+-	p, ok := self.partitions[dev]
+-	if !ok {
+-		return "", fmt.Errorf("no partition info for device %q", dev)
++	p, err := self.partitionCache.PartitionForDevice(dev)
++	if err != nil {
++		return "", err
+ 	}
+ 	return p.mountpoint, nil
+ }
+@@ -242,7 +102,8 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	for device, partition := range self.partitions {
++
++	self.partitionCache.ApplyOverPartitions(func(device string, partition partition) error {
+ 		_, hasMount := mountSet[partition.mountpoint]
+ 		_, hasDevice := deviceSet[device]
+ 		if mountSet == nil || (hasMount && !hasDevice) {
+@@ -261,6 +122,7 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
+ 				fs.Capacity, fs.Free, fs.Available, fs.Inodes, fs.InodesFree, err = getVfsStats(partition.mountpoint)
+ 				fs.Type = VFS
+ 			}
++
+ 			if err != nil {
+ 				glog.Errorf("Stat fs failed. Error: %v", err)
+ 			} else {
+@@ -274,7 +136,10 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
+ 				filesystems = append(filesystems, fs)
+ 			}
+ 		}
+-	}
++
++		return nil
++	})
++
+ 	return filesystems, nil
+ }
+ 
+@@ -353,12 +218,11 @@ func (self *RealFsInfo) GetDirFsDevice(dir string) (*DeviceInfo, error) {
+ 	}
+ 	major := major(buf.Dev)
+ 	minor := minor(buf.Dev)
+-	for device, partition := range self.partitions {
+-		if partition.major == major && partition.minor == minor {
+-			return &DeviceInfo{device, major, minor}, nil
+-		}
++	deviceInfo, err := self.partitionCache.DeviceForMajorMinor(major, minor)
++	if err != nil {
++		return nil, err
+ 	}
+-	return nil, fmt.Errorf("could not find device with major: %d, minor: %d in cached partitions map", major, minor)
++	return deviceInfo, nil
+ }
+ 
+ func (self *RealFsInfo) GetDirUsage(dir string, timeout time.Duration) (uint64, error) {
+@@ -400,6 +264,13 @@ func (self *RealFsInfo) GetDirUsage(dir string, timeout time.Duration) (uint64,
+ 	return usageInKb * 1024, nil
+ }
+ 
++func (self *RealFsInfo) RefreshCache() {
++	err := self.partitionCache.Refresh()
++	if err != nil {
++		glog.Warningf("Failed to refresh partition cache: %s")
++	}
++}
++
+ func getVfsStats(path string) (total uint64, free uint64, avail uint64, inodes uint64, inodesFree uint64, err error) {
+ 	var s syscall.Statfs_t
+ 	if err = syscall.Statfs(path, &s); err != nil {
+diff --git a/fs/partition_cache.go b/fs/partition_cache.go
+new file mode 100644
+index 0000000..6c97579
+--- /dev/null
++++ b/fs/partition_cache.go
+@@ -0,0 +1,288 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// +build linux
++package fs
++
++import (
++	"sync"
++	"github.com/docker/docker/pkg/mount"
++	"encoding/json"
++	"path"
++	"path/filepath"
++	"strings"
++	"fmt"
++	"github.com/golang/glog"
++)
++
++const (
++	LabelSystemRoot   = "root"
++	LabelDockerImages = "docker-images"
++)
++
++type RealPartitionCache struct {
++	dmsetup dmsetupClient
++	// Map from block device path to partition information.
++	partitions map[string]partition
++	// Labels are intent-specific tags that are auto-detected.
++	labels map[string]string
++	// For operations on partitions and labels
++	lock        sync.RWMutex
++	context     Context
++}
++
++func (self *RealPartitionCache) Refresh() error {
++	partitions := make(map[string]partition)
++	labels :=     make(map[string]string)
++
++	// TODO: Need to reset the stuff first
++	supportedFsType := map[string]bool{
++		// all ext systems are checked through prefix.
++		"btrfs": true,
++		"xfs":   true,
++		"zfs":   true,
++		"ecryptfs": true,
++	}
++
++	mounts, err := mount.GetMounts()
++	if err != nil {
++		return err
++	}
++	for _, mount := range mounts {
++		var Fstype string
++		if !strings.HasPrefix(mount.Fstype, "ext") && !supportedFsType[mount.Fstype] {
++			continue
++		}
++		// Avoid bind mounts.
++		if _, ok := partitions[mount.Source]; ok {
++			continue
++		}
++		if mount.Fstype == "zfs" {
++			Fstype = mount.Fstype  // This seems somewhat wrong?
++		}
++		partitions[mount.Source] = partition{
++			fsType:     Fstype,
++			mountpoint: mount.Mountpoint,
++			major:      uint(mount.Major),
++			minor:      uint(mount.Minor),
++		}
++	}
++
++	addDockerImagesLabel(self.context, self.dmsetup, labels, partitions)
++	addSystemRootLabel(labels, partitions)
++
++	// Get a lock before updating the cache
++	self.lock.Lock()
++	defer self.lock.Unlock()
++	self.partitions = partitions
++	self.labels = labels
++
++	return nil
++}
++
++func (self *RealPartitionCache) PartitionForDevice(device string) (partition, error) {
++	p, ok := self.partitions[device]
++	if ok {
++		return p, nil
++	}
++
++	glog.Infof("Failed to find partition for device %q, refreshing partition cache", device)
++	err := self.Refresh()
++	if err != nil {
++		return partition{}, err
++	}
++
++	p, ok = self.partitions[device]
++	if ok {
++		return p, nil
++	}
++
++	return partition{}, fmt.Errorf("No partition for device %s", device)
++}
++
++// TODo: We need to fault the cache if we can't find it here.
++func (self *RealPartitionCache) DeviceForMajorMinor(major uint, minor uint) (*DeviceInfo, error) {
++	for device, partition := range self.partitions {
++		if partition.major == major && partition.minor == minor {
++			return &DeviceInfo{device, major, minor}, nil
++		}
++	}
++	return nil, fmt.Errorf("could not find device with major: %d, minor: %d in cached partitions map", major, minor)
++}
++
++func (self *RealPartitionCache) ApplyOverPartitions(f (func(d string, p partition) error)) error {
++	if len(self.partitions) == 0 {
++		glog.Infof("Partition cache is empty: updating")
++		err := self.Refresh()
++		if err != nil {
++			return err
++		}
++	}
++	for device, partition := range self.partitions {
++		err := f(device, partition)
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func (self *RealPartitionCache) DeviceForLabel(label string) (string, error) {
++	d, ok := self.labels[label]
++	if ok {
++		return d, nil
++	}
++
++	glog.Infof("Failed to find device for label %q, refreshing partition cache", label)
++	err := self.Refresh()
++	if err != nil {
++		return "", err
++	}
++
++	d, ok = self.labels[label]
++	if ok {
++		return d, nil
++	}
++
++	return "", fmt.Errorf("No device for label %s", label)
++}
++
++func (self *RealPartitionCache) ApplyOverLabels(f (func(l string, d string) error)) error {
++	if len(self.labels) == 0 {
++		glog.Infof("Partition cache is empty: updating")
++		err := self.Refresh()
++		if err != nil {
++			return err
++		}
++	}
++
++	for label, device := range self.labels {
++		err := f(label, device)
++		if err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++func NewPartitionCache(context Context) (PartitionCache, error) {
++	partitionCache := &RealPartitionCache{
++		context:    context,  // TODO: Is this safe to access? :/
++		dmsetup:    &defaultDmsetupClient{},
++		partitions: make(map[string]partition),
++		labels:     make(map[string]string),
++	}
++	return partitionCache, nil
++}
++
++// Generate a list of possible mount points for docker image management from the docker root directory.
++// Right now, we look for each type of supported graph driver directories, but we can do better by parsing
++// some of the context from `docker info`.
++func getDockerImagePaths(context Context) []string {
++	// TODO(rjnagal): Detect docker root and graphdriver directories from docker info.
++	dockerRoot := context.DockerRoot
++	dockerImagePaths := []string{}
++	for _, dir := range []string{"devicemapper", "btrfs", "aufs", "overlay", "zfs"} {
++		dockerImagePaths = append(dockerImagePaths, path.Join(dockerRoot, dir))
++	}
++	for dockerRoot != "/" && dockerRoot != "." {
++		dockerImagePaths = append(dockerImagePaths, dockerRoot)
++		dockerRoot = filepath.Dir(dockerRoot)
++	}
++	dockerImagePaths = append(dockerImagePaths, "/")
++	return dockerImagePaths
++}
++
++
++// addSystemRootLabel attempts to determine which device contains the mount for /.
++func addSystemRootLabel(labels map[string]string, partitions map[string]partition) {
++	for src, p := range partitions {
++		if p.mountpoint == "/" {
++			if _, ok := labels[LabelSystemRoot]; !ok {
++				labels[LabelSystemRoot] = src
++			}
++		}
++	}
++}
++
++// addDockerImagesLabel attempts to determine which device contains the mount for docker images.
++func  addDockerImagesLabel(context Context, dmsetup dmsetupClient, labels map[string]string, partitions map[string]partition) {
++	dockerDev, dockerPartition, err := getDockerDeviceMapperInfo(context.DockerInfo, dmsetup)
++	if err != nil {
++		glog.Warningf("Could not get Docker devicemapper device: %v", err)
++	}
++	if len(dockerDev) > 0 && dockerPartition != nil {
++		partitions[dockerDev] = *dockerPartition
++		labels[LabelDockerImages] = dockerDev
++	} else {
++		dockerPaths := getDockerImagePaths(context)
++
++		for src, p := range partitions {
++			updateDockerImagesPath(src, p.mountpoint, dockerPaths, labels, partitions)
++		}
++	}
++}
++
++// This method compares the mountpoint with possible docker image mount points. If a match is found,
++// docker images label is added to the partition.
++func updateDockerImagesPath(source string, mountpoint string, dockerImagePaths []string, labels map[string]string, partitions map[string]partition) {
++	for _, v := range dockerImagePaths {
++		if v == mountpoint {
++			if i, ok := labels[LabelDockerImages]; ok {
++				// pick the innermost mountpoint.
++				mnt := partitions[i].mountpoint
++				if len(mnt) < len(mountpoint) {
++					labels[LabelDockerImages] = source
++				}
++			} else {
++				labels[LabelDockerImages] = source
++			}
++		}
++	}
++}
++
++// getDockerDeviceMapperInfo returns information about the devicemapper device and "partition" if
++// docker is using devicemapper for its storage driver. If a loopback device is being used, don't
++// return any information or error, as we want to report based on the actual partition where the
++// loopback file resides, inside of the loopback file itself.
++func getDockerDeviceMapperInfo(dockerInfo map[string]string, dmsetup dmsetupClient) (string, *partition, error) {
++	if storageDriver, ok := dockerInfo["Driver"]; ok && storageDriver != DeviceMapper.String() {
++		return "", nil, nil
++	}
++
++	var driverStatus [][]string
++	if err := json.Unmarshal([]byte(dockerInfo["DriverStatus"]), &driverStatus); err != nil {
++		return "", nil, err
++	}
++
++	dataLoopFile := dockerStatusValue(driverStatus, "Data loop file")
++	if len(dataLoopFile) > 0 {
++		return "", nil, nil
++	}
++
++	dev, major, minor, blockSize, err := dockerDMDevice(driverStatus, dmsetup)
++	if err != nil {
++		return "", nil, err
++	}
++
++	return dev, &partition{
++		fsType:    DeviceMapper.String(),
++		major:     major,
++		minor:     minor,
++		blockSize: blockSize,
++	}, nil
++}
++
+diff --git a/fs/types.go b/fs/types.go
+index 317af49..83217a2 100644
+--- a/fs/types.go
++++ b/fs/types.go
+@@ -60,6 +60,9 @@ type DiskStats struct {
+ }
+ 
+ type FsInfo interface {
++	// Refreshes the cache
++	RefreshCache()
++
+ 	// Returns capacity and free space, in bytes, of all the ext2, ext3, ext4 filesystems on the host.
+ 	GetGlobalFsInfo() ([]Fs, error)
+ 
+@@ -81,3 +84,12 @@ type FsInfo interface {
+ 	// Returns the mountpoint associated with a particular device.
+ 	GetMountpointForDevice(device string) (string, error)
+ }
++
++type PartitionCache interface {
++	Refresh() error
++	PartitionForDevice(device string) (partition, error)
++	DeviceForMajorMinor(major uint, minor uint) (*DeviceInfo, error)
++	ApplyOverPartitions(f (func(device string, p partition) error)) error 
++	DeviceForLabel(label string) (string, error)
++	ApplyOverLabels(f (func(label string, device string) error)) error 
++}
+-- 
+2.7.4
+

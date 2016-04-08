@@ -1,0 +1,50 @@
+From 404c237d7ed58c4a1e67f443453ae95a0cdd949c Mon Sep 17 00:00:00 2001
+From: Thomas Orozco <thomas@orozco.fr>
+Date: Fri, 8 Apr 2016 22:19:20 +0200
+Subject: [PATCH] Periodically refresh PartitionCache
+
+---
+ manager/manager.go | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/manager/manager.go b/manager/manager.go
+index aa6d186..24b019b 100644
+--- a/manager/manager.go
++++ b/manager/manager.go
+@@ -254,6 +254,11 @@ func (self *manager) Start() error {
+ 	self.quitChannels = append(self.quitChannels, quitGlobalHousekeeping)
+ 	go self.globalHousekeeping(quitGlobalHousekeeping)
+ 
++	// Update FS info to prevent it from going stale
++	quitFsInfoCacheManager := make(chan error)
++	self.quitChannels = append(self.quitChannels, quitFsInfoCacheManager)
++	go self.fsInfoCacheRefreshLoop(quitGlobalHousekeeping)
++
+ 	return nil
+ }
+ 
+@@ -273,6 +278,21 @@ func (self *manager) Stop() error {
+ 	return nil
+ }
+ 
++func (self *manager) fsInfoCacheRefreshLoop(quit chan error) {
++	ticker := time.Tick(1 * time.Minute)
++
++	for {
++		select {
++		case <- ticker:
++			self.fsInfo.RefreshCache()
++		case <- quit:
++			quit <- nil
++			glog.Infof("Exiting fsInfoCacheRefreshLoop")
++			return
++		}
++	}
++}
++
+ func (self *manager) globalHousekeeping(quit chan error) {
+ 	// Long housekeeping is either 100ms or half of the housekeeping interval.
+ 	longHousekeeping := 100 * time.Millisecond
+-- 
+2.7.4
+
